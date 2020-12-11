@@ -1,12 +1,54 @@
 import requests
 import pandas as pd
-import time
 from bs4 import BeautifulSoup
 from pathlib import Path
 import re
 import PyPDF2
 from datetime import datetime
-from pathlib import Path
+import numpy as np
+
+# adding throwaway comment to test pre-commit hook
+
+
+def check_and_parse_page(url):
+    response = requests.get(url)
+    checks = {"pass": [], "fail": []}
+
+    # checks if request went through successfully
+    if response.status_code == 200:
+        checks["pass"].append("request")
+    else:
+        checks["fail"].append("request")
+        checks["error_message"] = response.reason
+        return checks, None
+
+    # tries to parse HTML from response text
+    # Note: I've removed the try-except logic since no one has seen the error
+    # we're trying to catch. If we get a parse error in the future, then
+    # let's note the exception, restore the try-except, and catch it
+    soup = BeautifulSoup(response.text, "html.parser")
+    checks["pass"].append("html_parsing")
+
+    # if all checks pass set error message to none and return checks
+    checks["error_message"] = None
+    return checks, soup
+
+
+# months is here because it is used in multiple places
+months = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
 
 
 def parse_long_dates(date_string):
@@ -17,36 +59,43 @@ def parse_long_dates(date_string):
         date_string (str): The date in 'long' format
     Returns:
         year (str): The year as a four-character string
-        month (str): The month as a string representing an integer between 1 and 12
-        day (str): The day as a string representing an integer between 1 and 31
+        month (str): The month as a string representing an int between 1 and 12
+        day (str): The day as a string representing an int between 1 and 31
     """
+
+    date_regex = re.compile(r"([\w]*)\s+(\d{1,2})\D*(\d{4})", re.IGNORECASE)
+    date_re = date_regex.search(date_string)
+    if date_re is None:
+        return False, f"'{date_string}' is not a parseable date"
+    """
+    This regex captures any long date formats
+
+    The components of the regex:
+        (\w*) - First capture group, one or more word chars to find month
+        \s - Space between month and date, not captured
+        (\d{1,2}) - Second capture group, one or two numbers to find date
+        \D* - Non decimal chars between date and year, not captured
+        (\d{4}) - Third capture group, string of four numbers to find year
+    """
+
     # check for garbage at the end of the string
     while not date_string[-1].isnumeric():
         date_string = date_string[:-1]
-    # grab the front of the string, where we expect the three-letter month to be
-    month = date_string[:3]
-    # this error will come up, so we catch it
-    if month == "une":
-        month = "Jun"
+
+    # grabs the month.lower() from the regex match of the date_string
+    month_str = date_re.group(1).lower()
+    month_str, score = month_match_lev(month_str)
+    month = str(months.index(month_str) + 1).zfill(2)
+
     # grab the back of the string to get the year
-    year = date_string[-4:]
-    # try to convert the month to str(int) form, or throw an error
-    try:
-        month = str(time.strptime(month, "%b").tm_mon)
-    except ValueError as err:
-        print(f"month: {month}")
-        print(f"Encountered ValueError on file: {date_string}")
-    day = date_string.split(" ")[1]
-    day = "".join(filter(str.isdigit, day))
-    # check integrity
-    assert (
-        year.isnumeric()
-    ), f"The year is not numeric. year: {year} input: {date_string}"
-    assert (
-        month.isnumeric()
-    ), f"The month is not numeric. month: {month} input: {date_string}"
-    assert day.isnumeric(), f"The day is not numeric. day: {day} input: {date_string}"
-    return year, month, day
+    year = date_re.group(3)  # grabs year from third capture group in regex
+    day = date_re.group(2)  # grabs day from second capture group in regex
+
+    # converts year and day to string
+    year = str(year)
+    day = str(day).zfill(2)
+
+    return True, "_".join([year, month, day])
 
 
 def store_boe_pdfs(base_url, minutes_url):
@@ -54,13 +103,17 @@ def store_boe_pdfs(base_url, minutes_url):
     repository for later analysis.
     Args:
         base_url (str): The main url for the Comptroller of Baltimore's webiste
-        minutes_url (str): The url where the function can find links to pages of
-            pdf files organized by year
+        minutes_url (str): The url where the function can find links to
+            pages of pdf files organized by year
     Returns:
         None: This is a void function.
     """
-    response = requests.get(minutes_url)
-    soup = BeautifulSoup(response.text, "html.parser")
+
+    checks, soup = check_and_parse_page(minutes_url)
+    if checks["fail"]:
+        print(f"Encountered an issue accessing {minutes_url}")
+        print(f"Exiting due to the following error: {checks['error_message']}")
+        return
     root = Path.cwd()
     pdf_dir = root / "pdf_files"
     total_counter = 0
@@ -68,7 +121,9 @@ def store_boe_pdfs(base_url, minutes_url):
     if not pdf_dir.is_dir():
         pdf_dir.mkdir(parents=True, exist_ok=False)
 
-    for year in range(2009, 2021):
+    year_links = get_year_links(soup)
+
+    for year in year_links.keys():
         # make a directory for the files
         save_path = pdf_dir / str(year)
         save_path.mkdir(parents=True, exist_ok=True)
@@ -77,8 +132,14 @@ def store_boe_pdfs(base_url, minutes_url):
         annual_url = base_url + link["href"]
         print(f"Saving files from url: {annual_url}")
         # now follow the link to the page with that year's pdfs
-        response_annual = requests.get(annual_url)
-        soup_annual = BeautifulSoup(response_annual.text, "html.parser")
+        checks, soup_annual = check_and_parse_page(annual_url)
+        if checks["fail"]:
+            print(f"Encountered an issue accessing {annual_url}")
+            print(
+                "Escaping the current loop due to the following error: "
+                f"{checks['error_message']}"
+            )
+            continue
         pdf_links = soup_annual.find_all(name="a", href=re.compile("files"))
         for idx, link in enumerate(pdf_links):
             pdf_location = link["href"]
@@ -90,150 +151,19 @@ def store_boe_pdfs(base_url, minutes_url):
                 link.get_text().strip().encode("ascii", "ignore").decode("utf-8")
             )
             # handle cases where the date is written out in long form
-            if any(char.isdigit() for char in pdf_html_text):
-                pdf_year, pdf_month, pdf_day = parse_long_dates(pdf_html_text)
-                pdf_filename = "_".join([pdf_year, pdf_month, pdf_day]) + ".pdf"
-                try:
-                    with open(save_path / pdf_filename, "wb") as f:
-                        f.write(pdf_file.content)
-                    total_counter += 1
-                except TypeError as err:
-                    print(f"an error occurred with path {pdf_location}: {err}")
+            parsed, pdf_date = parse_long_dates(pdf_html_text)
+            if not parsed:
+                print(pdf_date)  # error message
+                continue
+            pdf_filename = pdf_date + ".pdf"
+            try:
+                with open(save_path / pdf_filename, "wb") as f:
+                    f.write(pdf_file.content)
+                total_counter += 1
+            except TypeError as err:
+                print(f"an error occurred with path {pdf_location}: {err}")
     print(f"Wrote {total_counter} .pdf files to local repo.")
     return
-
-
-def get_boe_minutes(base_url="https://comptroller.baltimorecity.gov",
-                    minutes_url_part="/boe/meetings/minutes",
-                    save_folder='BoE Minutes PDFs',
-                    start_dir=os.path.dirname(__file__)):
-    """
-    base_url:
-        url for the comptrollers website
-
-    minutes_url:
-        the extra bit of the URL that specifies the minutes "landing page"
-
-        https://comptroller.baltimorecity.gov/boe/meetings/minutes
-
-    save_folder:
-        the name of the folder used to hold the minutes PDFs,
-        shouldn't have any slashes
-
-    start_dir:
-        defaults to the directory the calling script is in. used to
-        make a full path (relative to the calling script or absolute)
-        with save_folder
-    """
-    # print(start_dir)  # print the directory this script is in
-    os.chdir(start_dir)  # set the cwd to avoid any OS/python shenanigans
-    pdf_save_dir = f'{start_dir}/{save_folder}/'  # set save directory for pdfs
-    os.makedirs(pdf_save_dir, exist_ok=True)  # create directory if it doesn't exist (no error if it does)
-    minutes_url = base_url + minutes_url_part
-
-    # because whoever wrote the BoE website didn't make it easy to scrape
-    # date_regex = re.compile(r'([(January|February|March|April|May|June|July|August|September|October|November|December)]) (\d{1,2}), (\d{4})', re.IGNORECASE)
-    date_regex = re.compile(r'(\w*)\s+(\d{1,2})\D*(\d{4})', re.IGNORECASE)
-    """
-    This regex captures any long date formats
-
-    The compoents of the regex:
-        (\w*) - First capture group, one or more word chars to find month
-        \s - Space between month and date, not captured
-        (\d{1,2}) - Second capture group, one or two numbers to find date
-        \D* - Non decimal chars between date and year, not captured
-        (\d{4}) - Third capture group, string of four numbers to find year
-    """
-    month_dict = {'january': '01',
-                  'february': '02',
-                  'march': '03',
-                  'april': '04',
-                  'may': '05',
-                  'june': '06',
-                  'july': '07',
-                  'august': '08',
-                  'september': '09',
-                  'october': '10',
-                  'november': '11',
-                  'december': '12'}
-
-    # this creates a dictionary containing all possible single-letter deletions of every month
-    # it's used to correct for typos in the text of a link to the minutes
-    # ex: Novembe 17, 2010 (one of two real examples as of Aug 9, 2020)
-    typo_dict = {k: list() for k in month_dict.keys()}
-    for month in typo_dict.keys():
-        for i in range(len(month)):
-            typo_dict[month].append(month[:i] + month[i+1:])
-
-    start_page = requests.get(minutes_url)  # grab the 'starting page' that provides links to the minutes for a specific year
-    start_page.raise_for_status()  # doing the \
-    start_soup = BS(start_page.text, 'lxml')  # needful
-
-    # this eliminates the need to specify the years to grab since four-digit years are used consistently
-    year_tags = start_soup.find_all('a', href=True, text=re.compile(r'^\d{4}$'))  # find the tags that link to the minutes for specific years
-    year_links = [tag.get('href') for tag in year_tags]  # extracting the links
-
-    for link in year_links:
-        print(link)
-        year_page = requests.get(link)
-        year_page.raise_for_status()
-        soup = BS(year_page.text, 'lxml')
-
-        minutes_tags = soup.find_all('a', text=date_regex)  # grab tags that link to the pdfs
-
-        for tag in minutes_tags:
-            file_name_re = date_regex.search(tag.string)
-            # example filename: 'BoE Minutes 2009-04-01.pdf'
-
-            try:  # most links will fit this pattern
-                file_name = (
-                    'BoE Minutes '
-                    + file_name_re.group(3) # year
-                    + '-'
-                    + month_dict[file_name_re.group(1).lower()] # month
-                    + '-'
-                    + file_name_re.group(2).zfill(2) # day
-                    + '.pdf'
-                )
-            except KeyError as e:  # this code only triggers if there's a typo in the month string
-                month_error = file_name_re.group(1).lower()
-                print(f'Error "{e}" for minutes on: "{tag.string}", '
-                      f'regex found: {file_name_re.groups()}. '
-                      f'Attempting typo matching...')
-                for k, v in typo_dict.items():  # this loop searches for matches among single-letter deletions
-                    correct_month = False
-                    if month_error in v:
-                        correct_month = k
-                        break
-
-                if correct_month:  # if we found a match
-                    file_name = (
-                        'BoE Minutes '
-                        + file_name_re.group(3) # year
-                        + '-'
-                        + month_dict[correct_month] # month
-                        + '-'
-                        + file_name_re.group(2).zfill(2) # day
-                        + '.pdf'
-                    )
-                else:
-                    #  sorry, you'll have to update the regex if you hit this code
-                    print(f'Error: could not match month string '
-                          f'{file_name_re.group(1)} in '
-                          f'match {file_name_re.groups()}. ')
-
-            if os.path.exists(pdf_save_dir + file_name):  # skip the download if we've already done it
-                print(f'skipping: {file_name}')
-            else:
-                if tag.get('href').startswith('http'):  # because there is literally ONE link in the entire list that is an absolute path
-                    min_url = tag.get('href')
-                else:
-                    min_url = base_url + tag.get('href')
-                minutes_req = requests.get(min_url)
-                minutes_req.raise_for_status()
-                with open(pdf_save_dir + file_name, 'wb') as p:  # save the file
-                    p.write(minutes_req.content)
-                print(f'saved: {file_name}')
 
 
 def store_pdf_text_to_df(path):
@@ -255,7 +185,7 @@ def store_pdf_text_to_df(path):
         pdfFileObj = open(pdf_path, "rb")
         try:
             pdfReader = PyPDF2.PdfFileReader(pdfFileObj, strict=False)
-        except:
+        except ValueError:
             print(f"An error occurred reading file {pdf_path}")
         for page in pdfReader.pages:
             minutes += page.extractText().strip()
@@ -268,11 +198,7 @@ def store_pdf_text_to_df(path):
         else:
             page_number = ""
         try:
-            row = {
-                "date": date,
-                "page_number": page_number,
-                "minutes": minutes.strip()
-            }
+            row = {"date": date, "page_number": page_number, "minutes": minutes.strip()}
             text_df = text_df.append(row, ignore_index=True)
         except ValueError:
             print(f"No date found for file {pdf_path}")
@@ -284,8 +210,127 @@ def is_empty(_dir: Path) -> bool:
     return not bool([_ for _ in _dir.iterdir()])
 
 
-def replace_chars(val):
-    val = " ".join(val.split())
-    val = val.replace("™", "'")
-    val = val.replace("Œ", "-")
-    return val
+def replace_chars(text):
+    replacements = [
+        ("Œ", "-"),
+        ("ﬁ", '"'),
+        ("ﬂ", '"'),
+        ("™", "'"),
+        ("Ł", "•"),
+        (",", "'"),
+        ("Š", "-"),
+        ("€", " "),
+        ("¬", "-"),
+        ("–", "…"),
+        ("‚", "'"),
+        ("Ž", "™"),
+        ("˚", "fl"),
+        ("˜", "fi"),
+        ("˛", "ff"),
+        ("˝", "ffi"),
+        ("š", "—"),
+        ("ü", "ti"),
+        ("î", "í"),
+        ("è", "c"),
+        ("ë", "e"),
+        ("Ð", "–"),
+        ("Ò", '"'),
+        ("Ó", '"'),
+        ("Õ", "'"),
+    ]
+    for i in replacements:
+        text = text.replace(i[0], i[1])
+    return text
+
+
+def del_dir_contents(root):
+    """Convenience function so we don't have to empy out pdf_dir by hand
+    during testing.
+
+    Removes all
+    """
+    for p in root.iterdir():
+        if p.is_dir():
+            del_dir_contents(p)
+        else:
+            p.unlink()
+    for p in root.iterdir():
+        if p.is_dir():
+            p.rmdir()
+    return
+
+
+def get_year_links(start_soup):
+    """
+    Args:
+        start_soup (BeautifulSoup object): the beautifulsoup object that
+        parses the "landing page" for the minutes links
+
+    Returns:
+        year_links (dict): dictionary with the years (2009, 2010, ...,
+        current year) as keys and relative links as values
+    """
+    # this eliminates the need to specify the years to grab since
+    # four-digit years are used consistently
+    year_tags = start_soup.find_all(
+        "a", href=True, text=re.compile(r"^20\d{2}$")
+    )  # find the tags that link to the minutes for specific years
+    year_links = {
+        tag.string: tag.get("href") for tag in year_tags
+    }  # extracting the links
+
+    return year_links
+
+
+def lev(token1, token2):
+    distances = np.zeros((len(token1) + 1, len(token2) + 1))
+
+    for t1 in range(len(token1) + 1):
+        distances[t1][0] = t1
+
+    for t2 in range(len(token2) + 1):
+        distances[0][t2] = t2
+
+    a = 0
+    b = 0
+    c = 0
+
+    for t1 in range(1, len(token1) + 1):
+        for t2 in range(1, len(token2) + 1):
+            if token1[t1 - 1] == token2[t2 - 1]:
+                distances[t1][t2] = distances[t1 - 1][t2 - 1]
+            else:
+                a = distances[t1][t2 - 1]
+                b = distances[t1 - 1][t2]
+                c = distances[t1 - 1][t2 - 1]
+
+                if a <= b and a <= c:
+                    distances[t1][t2] = a + 1
+                elif b <= a and b <= c:
+                    distances[t1][t2] = b + 1
+                else:
+                    distances[t1][t2] = c + 1
+
+    return distances[len(token1)][len(token2)]
+
+
+def month_match_lev(text):
+    """
+    Args:
+        text (str): the misspelled month string
+
+    Returns:
+        best_match (str): the month string that best matches the misspelled input
+        best_score (int): the Levenshtein distance between text and best_match
+    """
+    text = text.lower()
+    best_match = ""
+    best_score = 9999  # lower scores are better
+    for i in months:
+        # lev dist == num changes to make text into i
+        score = lev(text, i)
+        if score < best_score:
+            best_score = score
+            best_match = i
+
+    return best_match, best_score
